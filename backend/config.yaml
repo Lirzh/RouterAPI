@@ -1,0 +1,51 @@
+# RouterAPI 配置文件
+server:
+  port: 3000
+  mode: debug  # debug | release
+  jwt_secret: "change-me-to-a-random-secret"
+  jwt_expire_hours: 48
+
+database:
+  driver: sqlite          # sqlite | postgres
+  path: ./data/routerapi.db   # sqlite 数据文件
+  # PostgreSQL 连接（driver=postgres 时使用）；也可直接填写完整 dsn
+  # dsn: "host=localhost port=5432 user=routerapi password=secret dbname=routerapi sslmode=disable"
+  host: localhost
+  port: 5432
+  user: routerapi
+  password: ""
+  dbname: routerapi
+  sslmode: disable
+
+# 前端静态文件目录 (生产模式)
+frontend_dist: ../frontend/dist
+
+# 默认管理员 (首次启动自动创建)
+admin:
+  username: admin
+  password: admin123
+
+# 日志保留天数
+log_retention_days: 30
+
+# 跨供应商重试次数（0=不重试）
+retry:
+  times: 2
+
+# 后台健康探测（熔断供应商自动恢复）
+health:
+  enabled: true
+  interval_minutes: 5
+
+# 积分钱包：启用后按模型定价扣减积分（余额门槛 + 请求后原子扣减 + 流水）。
+# 关闭则不计费、不拦截，仅记录 token 用量。
+billing:
+  enabled: true
+
+# 可信代理（用于正确解析 X-Forwarded-For 得到真实客户端 IP）
+# 留空表示不信任任何代理（公网部署的保守安全默认）
+# 部署在反向代理之后时填写代理网段，例如：
+# trusted_proxies:
+#   - 127.0.0.1
+#   - 10.0.0.0/8
+trusted_proxies: []
