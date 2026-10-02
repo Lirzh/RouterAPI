@@ -1,10 +1,14 @@
-// Package cleanup 提供后台日志保留清理：按 log_retention_days 分批删除过期的调用日志。
-// 仅清理 RequestLog（消费/错误日志）；AuditLog 长期保留，不参与清理。
+// Package cleanup 提供后台维护任务：按 log_retention_days 分批清理过期调用日志，
+// 以及回收泄漏的积分预留。
+//
+// 日志清理仅涉及 RequestLog（消费/错误日志）；AuditLog 长期保留，不参与清理。
+// 预留回收则无条件运行——它守的是"钱被占住拿不回来"，不能跟着日志开关一起被关掉。
 package cleanup
 
 import (
 	"time"
 
+	"github.com/routerapi/backend/internal/billing"
 	"github.com/routerapi/backend/internal/model"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
@@ -13,7 +17,19 @@ import (
 // batchDeleteSize 每批删除的行数，避免长事务与锁表。
 const batchDeleteSize = 1000
 
-// Monitor 周期性清理过期日志的后台任务。
+// reserveSweepInterval 预留回收轮询间隔。
+//
+// 比日志清理频繁得多：泄漏的额度在回收前是不可用的，而正常请求远快于 DefaultReserveTTL，
+// 所以扫得勤只多几次空查询，却能把崩溃后的额度冻结时间压到分钟级。
+const reserveSweepInterval = 5 * time.Minute
+
+// reserveKeepFor 终态预留行的保留时长。
+//
+// 预留表是"每请求一行"，不清理会随流量线性膨胀。终态行可以激进删除：
+// 钱已经落到 CreditTransaction，而那条流水本身就带 request_id，审计链不会断。
+const reserveKeepFor = 24 * time.Hour
+
+// Monitor 周期性执行日志保留清理与积分预留回收的后台任务。
 type Monitor struct {
 	db            *gorm.DB
 	retentionDays int
@@ -21,31 +37,41 @@ type Monitor struct {
 	stop          chan struct{}
 }
 
-// NewMonitor 创建清理任务；retentionDays<=0 表示不清理（Start 将直接返回）。
+// NewMonitor 创建清理任务；retentionDays<=0 仅表示不清理日志，预留回收照常进行。
 func NewMonitor(db *gorm.DB, retentionDays int) *Monitor {
 	return &Monitor{db: db, retentionDays: retentionDays, interval: time.Hour, stop: make(chan struct{})}
 }
 
-// Start 启动后台清理（立即执行一次，随后按小时轮询）。
+// Start 启动后台任务（立即执行一轮，随后按各自节奏轮询）。
 func (m *Monitor) Start() {
 	if m.retentionDays <= 0 {
-		logrus.Info("日志保留天数 <=0，已禁用日志清理任务")
-		return
+		logrus.Info("日志保留天数 <=0，已禁用日志清理（积分预留回收仍然运行）")
 	}
 	go func() {
-		m.run() // 启动即清理一次
-		ticker := time.NewTicker(m.interval)
-		defer ticker.Stop()
+		m.sweepReservations() // 启动即回收一次：崩溃前遗留的预留不该继续冻住用户额度
+		if m.retentionDays > 0 {
+			m.run()
+		}
+
+		sweepTicker := time.NewTicker(reserveSweepInterval)
+		defer sweepTicker.Stop()
+		logTicker := time.NewTicker(m.interval)
+		defer logTicker.Stop()
+
 		for {
 			select {
 			case <-m.stop:
 				return
-			case <-ticker.C:
-				m.run()
+			case <-sweepTicker.C:
+				m.sweepReservations()
+			case <-logTicker.C:
+				if m.retentionDays > 0 {
+					m.run()
+				}
 			}
 		}
 	}()
-	logrus.Infof("日志清理任务已启动，保留 %d 天，每小时检查一次", m.retentionDays)
+	logrus.Infof("后台清理任务已启动（日志保留 %d 天，预留每 %s 回收一次）", m.retentionDays, reserveSweepInterval)
 }
 
 // Stop 停止后台清理。
@@ -67,6 +93,22 @@ func (m *Monitor) run() {
 	}
 	if deleted > 0 {
 		logrus.Infof("日志清理完成：删除 %d 条早于 %s 的调用日志", deleted, cutoff.Format("2006-01-02 15:04:05"))
+	}
+}
+
+// sweepReservations 回收 TTL 到期仍未结算的预留，并删除过期的终态预留行。
+func (m *Monitor) sweepReservations() {
+	now := time.Now()
+	if n, err := billing.SweepExpired(m.db, now); err != nil {
+		logrus.Errorf("积分预留回收失败: %v", err)
+	} else if n > 0 {
+		logrus.Warnf("积分预留回收：退还 %d 笔超时未结算的预留额度", n)
+	}
+	// 终态行只作短期排障用，审计链在 CreditTransaction 里，删掉不丢证据。
+	res := m.db.Where("status <> ? AND updated_at < ?", model.ReservationActive, now.Add(-reserveKeepFor)).
+		Delete(&model.QuotaReservation{})
+	if res.Error != nil {
+		logrus.Errorf("清理终态预留失败: %v", res.Error)
 	}
 }
 

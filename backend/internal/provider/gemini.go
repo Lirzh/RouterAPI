@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/routerapi/backend/internal/errkit"
+	"github.com/routerapi/backend/internal/ir"
 	"github.com/sirupsen/logrus"
 )
 
@@ -92,16 +93,44 @@ type geminiResponse struct {
 			Parts []struct {
 				Text         string              `json:"text,omitempty"`
 				FunctionCall *geminiFunctionCall `json:"functionCall,omitempty"`
+				// Thought 标记该 part 是思维链而非正文；ThoughtSignature 是它的回放签名
+				// （多轮工具调用时需要带回去，否则思维链历史会被拒）。
+				Thought          bool   `json:"thought,omitempty"`
+				ThoughtSignature string `json:"thoughtSignature,omitempty"`
 			} `json:"parts"`
 			Role string `json:"role"`
 		} `json:"content"`
 		FinishReason string `json:"finishReason"`
 	} `json:"candidates"`
-	UsageMetadata struct {
-		PromptTokenCount     int `json:"promptTokenCount"`
-		CandidatesTokenCount int `json:"candidatesTokenCount"`
-		TotalTokenCount      int `json:"totalTokenCount"`
-	} `json:"usageMetadata"`
+	UsageMetadata geminiUsage `json:"usageMetadata"`
+}
+
+// geminiUsage Gemini 的 usageMetadata。
+//
+// 与 IR 计费契约的对应关系：cachedContentTokenCount 本身就是 promptTokenCount 的
+// 子集（直接符合契约）；thoughtsTokenCount 却不包含在 candidatesTokenCount 里，
+// 而 OpenAI 的 completion_tokens 是含推理 token 的，所以这里把 thoughts 并进输出侧。
+// Gemini 自己的 totalTokenCount 已经算了 thoughts，故 Total 直接取用即可。
+type geminiUsage struct {
+	PromptTokenCount        int `json:"promptTokenCount"`
+	CandidatesTokenCount    int `json:"candidatesTokenCount"`
+	TotalTokenCount         int `json:"totalTokenCount"`
+	ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
+	CachedContentTokenCount int `json:"cachedContentTokenCount"`
+}
+
+func (g geminiUsage) toIR() Usage {
+	total := g.TotalTokenCount
+	if total == 0 {
+		total = g.PromptTokenCount + g.CandidatesTokenCount + g.ThoughtsTokenCount
+	}
+	return Usage{
+		PromptTokens:     g.PromptTokenCount,
+		CompletionTokens: g.CandidatesTokenCount + g.ThoughtsTokenCount,
+		TotalTokens:      total,
+		CachedTokens:     g.CachedContentTokenCount,
+		ReasoningTokens:  g.ThoughtsTokenCount,
+	}
 }
 
 func (p *GeminiProvider) convertRequest(req *ChatRequest) *geminiRequest {
@@ -224,20 +253,29 @@ func geminiInlineDataFromURL(url string) (*geminiInlineData, bool) {
 }
 
 func (p *GeminiProvider) convertResponse(resp *geminiResponse, model string) *ChatResponse {
-	var content string
+	var content, reasoning, signature string
 	var toolCalls []ToolCall
 	finishReason := "stop"
 	if len(resp.Candidates) > 0 {
 		cand := resp.Candidates[0]
 		for _, part := range cand.Content.Parts {
-			content += part.Text
-			if part.FunctionCall != nil {
+			// thought=true 的 part 是思维链，必须与正文分开：混进 content 会让
+			// 客户端无法折叠思考过程，也会把思维链当成答案文本计入兜底 token 估算。
+			switch {
+			case part.FunctionCall != nil:
 				args, _ := json.Marshal(part.FunctionCall.Args)
 				toolCalls = append(toolCalls, ToolCall{
-					ID:   fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), len(toolCalls)),
-					Type: "function",
+					ID:       fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), len(toolCalls)),
+					Type:     "function",
 					Function: ToolCallFunction{Name: part.FunctionCall.Name, Arguments: string(args)},
 				})
+			case part.Thought:
+				reasoning += part.Text
+				if part.ThoughtSignature != "" {
+					signature = part.ThoughtSignature
+				}
+			default:
+				content += part.Text
 			}
 		}
 		if cand.FinishReason != "" {
@@ -251,19 +289,16 @@ func (p *GeminiProvider) convertResponse(resp *geminiResponse, model string) *Ch
 		Created: time.Now().Unix(),
 		Model:   model,
 		Choices: []Choice{
-			{Index: 0, Message: Message{Role: "assistant", Content: content, ToolCalls: toolCalls}, FinishReason: finishReason},
+			{Index: 0, Message: Message{Role: "assistant", Content: content, ToolCalls: toolCalls,
+				ReasoningContent: reasoning, ReasoningSignature: signature}, FinishReason: finishReason},
 		},
-		Usage: Usage{
-			PromptTokens:     resp.UsageMetadata.PromptTokenCount,
-			CompletionTokens: resp.UsageMetadata.CandidatesTokenCount,
-			TotalTokens:      resp.UsageMetadata.TotalTokenCount,
-		},
+		Usage: resp.UsageMetadata.toIR(),
 	}
 }
 
 func (p *GeminiProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
 	gr := p.convertRequest(req)
-	body, err := json.Marshal(gr)
+	body, err := ir.MarshalWithExtra(gr, req.ReplayableExtra(ir.ProtocolGemini))
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +316,7 @@ func (p *GeminiProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRespo
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readAllCapped(resp.Body)
 	if err != nil {
 		return nil, errkit.ChannelError(0, "读取响应失败: "+err.Error(), err)
 	}
@@ -300,7 +335,7 @@ func (p *GeminiProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRespo
 
 func (p *GeminiProvider) ChatStream(ctx context.Context, req *ChatRequest) (<-chan ChatChunk, error) {
 	gr := p.convertRequest(req)
-	body, err := json.Marshal(gr)
+	body, err := ir.MarshalWithExtra(gr, req.ReplayableExtra(ir.ProtocolGemini))
 	if err != nil {
 		return nil, err
 	}
@@ -318,7 +353,7 @@ func (p *GeminiProvider) ChatStream(ctx context.Context, req *ChatRequest) (<-ch
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBodyBytes))
 		resp.Body.Close()
 		return nil, errkit.ClassifyUpstream(resp.StatusCode, string(respBody))
 	}
@@ -329,7 +364,7 @@ func (p *GeminiProvider) ChatStream(ctx context.Context, req *ChatRequest) (<-ch
 		defer resp.Body.Close()
 
 		decoder := newSSEDecoder(resp.Body)
-		var promptT, compT, totalT int
+		var acc geminiUsage
 		finishSeen := ""
 		for {
 			data, err := decoder.Next()
@@ -344,26 +379,30 @@ func (p *GeminiProvider) ChatStream(ctx context.Context, req *ChatRequest) (<-ch
 			if err := json.Unmarshal([]byte(data), &gr2); err != nil {
 				continue
 			}
-			// 采集 usageMetadata（可能出现在最后一个候选为空的帧）
+			// 采集 usageMetadata（可能出现在最后一个候选为空的帧）；取最新的一份完整计数。
 			if gr2.UsageMetadata.TotalTokenCount > 0 {
-				promptT = gr2.UsageMetadata.PromptTokenCount
-				compT = gr2.UsageMetadata.CandidatesTokenCount
-				totalT = gr2.UsageMetadata.TotalTokenCount
+				acc = gr2.UsageMetadata
 			}
 			if len(gr2.Candidates) == 0 {
 				continue
 			}
 
 			cand := gr2.Candidates[0]
-			var text string
+			var text, reasoning string
 			for _, part := range cand.Content.Parts {
+				// 与非流式一致地按 thought 标记分流；一律累加进 text 会把思维链
+				// 混进正文，客户端既无法折叠、兜底 token 估算也会把思考算成答案。
+				if part.Thought {
+					reasoning += part.Text
+					continue
+				}
 				text += part.Text
 			}
-			if text != "" {
+			if text != "" || reasoning != "" {
 				chunk := ChatChunk{
 					ID: "chatcmpl-gem", Object: "chat.completion.chunk",
 					Created: time.Now().Unix(), Model: req.Model,
-					Choices: []ChunkChoice{{Index: 0, Delta: Delta{Content: text}}},
+					Choices: []ChunkChoice{{Index: 0, Delta: Delta{Content: text, ReasoningContent: reasoning}}},
 				}
 				select {
 				case <-ctx.Done():
@@ -387,7 +426,7 @@ func (p *GeminiProvider) ChatStream(ctx context.Context, req *ChatRequest) (<-ch
 		}:
 		}
 		// usage 末帧
-		usage := Usage{PromptTokens: promptT, CompletionTokens: compT, TotalTokens: totalT}
+		usage := acc.toIR()
 		select {
 		case <-ctx.Done():
 			return
@@ -422,17 +461,27 @@ func (p *GeminiProvider) Models(ctx context.Context) ([]string, error) {
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
-		return nil, err
+		return nil, errkit.ChannelError(0, "请求上游失败: "+err.Error(), err)
 	}
 	defer resp.Body.Close()
+
+	body, err := readAllCapped(resp.Body)
+	if err != nil {
+		return nil, errkit.ChannelError(0, "读取响应失败: "+err.Error(), err)
+	}
+	// 必须检查状态码：401/403 的错误体 {"error":{...}} 也能被正常解码成"models 字段缺失"，
+	// 早先不检查时会返回空列表 + nil error，让健康探测把密钥已死的供应商判为健康并清除熔断。
+	if resp.StatusCode != http.StatusOK {
+		return nil, errkit.ClassifyUpstream(resp.StatusCode, string(body))
+	}
 
 	var result struct {
 		Models []struct {
 			Name string `json:"name"`
 		} `json:"models"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, errkit.UpstreamError(http.StatusBadGateway, "解析模型列表失败", err)
 	}
 
 	models := make([]string, 0, len(result.Models))

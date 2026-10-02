@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -21,24 +22,18 @@ func NewAPIKeyHandler(db *gorm.DB) *APIKeyHandler {
 	return &APIKeyHandler{db: db}
 }
 
-func maskAPIKey(k *model.APIKey) {
-	if k.Key != "" {
-		k.KeyMasked = crypto.MaskString(k.Key)
-		k.Key = ""
-	}
-}
+// minAPIKeyLen 自定义密钥的最短长度。允许管理员填 "test" 就等于把 bearer 凭证退回可猜，
+// 而库里只存摘要反而给人一种"已经安全了"的错觉。
+const minAPIKeyLen = 24
 
-// List API Key 列表（脱敏）。
+// List API Key 列表。库里只有摘要与脱敏形态，明文无从返回。
 func (h *APIKeyHandler) List(c *gin.Context) {
 	var keys []model.APIKey
 	h.db.Order("created_at DESC").Find(&keys)
-	for i := range keys {
-		maskAPIKey(&keys[i])
-	}
 	c.JSON(http.StatusOK, gin.H{"data": keys})
 }
 
-// Create 创建 API Key。
+// Create 创建 API Key。明文只在本响应里出现一次，之后谁也拿不回来。
 func (h *APIKeyHandler) Create(c *gin.Context) {
 	var req model.APIKey
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -55,24 +50,47 @@ func (h *APIKeyHandler) Create(c *gin.Context) {
 		req.OwnerUserID = c.GetUint("user_id")
 	}
 
-	if req.Key == "" {
-		req.Key = "ra-" + generateRandomKey(32)
-	} else if !strings.HasPrefix(req.Key, "ra-") {
-		req.Key = "ra-" + req.Key
+	secret := strings.TrimSpace(req.Key)
+	if secret == "" {
+		secret = "ra-" + generateRandomKey(32)
+	} else if !strings.HasPrefix(secret, "ra-") {
+		secret = "ra-" + secret
+	}
+	if len(secret) < minAPIKeyLen {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "自定义密钥至少需要 " + strconv.Itoa(minAPIKeyLen) + " 个字符"})
+		return
 	}
 	if req.Status == 0 {
 		req.Status = 1
 	}
 
-	if err := h.db.Create(&req).Error; err != nil {
+	// 只把摘要与脱敏形态交给 GORM；明文永不入库，也不进任何日志。
+	req.Key = ""
+	req.KeyHash = crypto.HashSecret(secret)
+	req.KeyMasked = crypto.MaskString(secret)
+
+	created := req
+	if err := h.db.Create(&created).Error; err != nil {
+		if isUniqueViolation(err) {
+			c.JSON(http.StatusConflict, gin.H{"error": "该密钥已存在"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建失败: " + err.Error()})
 		return
 	}
-	// 创建时返回一次明文 Key（此后仅脱敏）
-	c.JSON(http.StatusOK, gin.H{"data": req})
+	created.Key = secret
+	c.JSON(http.StatusOK, gin.H{"data": created})
 }
 
-// Update 更新 API Key（不更新 key 本身）。
+// apiKeyUpdatable 是更新允许改动的列。白名单而非透传请求体：
+// 直接把 JSON map 交给 Updates，调用方就能写 key_hash/status 之类不该由请求决定的列。
+var apiKeyUpdatable = []string{
+	"name", "owner_user_id", "status", "credits_cap", "rate_limit_rpm",
+	"allowed_vendors", "allowed_models", "allow_ips", "expires_at",
+}
+
+// Update 更新 API Key 的配置。密钥本身不可改——明文已经不存在了，
+// 要换密钥就重建一条（旧的对立刻失效）。
 func (h *APIKeyHandler) Update(c *gin.Context) {
 	id := c.Param("id")
 	var key model.APIKey
@@ -85,10 +103,19 @@ func (h *APIKeyHandler) Update(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
 		return
 	}
-	delete(req, "key")
-	h.db.Model(&key).Updates(req)
+	patch := make(map[string]interface{}, len(apiKeyUpdatable))
+	for _, col := range apiKeyUpdatable {
+		if v, ok := req[col]; ok {
+			patch[col] = v
+		}
+	}
+	if len(patch) > 0 {
+		if err := h.db.Model(&key).Updates(patch).Error; err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "更新失败: " + err.Error()})
+			return
+		}
+	}
 	h.db.First(&key, id)
-	maskAPIKey(&key)
 	c.JSON(http.StatusOK, gin.H{"data": key})
 }
 

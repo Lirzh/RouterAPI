@@ -31,6 +31,8 @@ interface ModelItem {
   enabled: boolean
   prompt_credits_per_1m: number
   completion_credits_per_1m: number
+  cache_read_credits_per_1m: number
+  cache_write_credits_per_1m: number
   bindings: Binding[]
 }
 
@@ -57,6 +59,8 @@ const form = reactive({
   enabled: true,
   prompt_credits_per_1m: 0,
   completion_credits_per_1m: 0,
+  cache_read_credits_per_1m: 0,
+  cache_write_credits_per_1m: 0,
 })
 
 // 绑定管理
@@ -103,7 +107,11 @@ async function loadVendors() {
 // ---------- 模型 CRUD ----------
 function openCreate() {
   editingId.value = null
-  Object.assign(form, { name: '', display_name: '', description: '', enabled: true, prompt_credits_per_1m: 0, completion_credits_per_1m: 0 })
+  Object.assign(form, {
+    name: '', display_name: '', description: '', enabled: true,
+    prompt_credits_per_1m: 0, completion_credits_per_1m: 0,
+    cache_read_credits_per_1m: 0, cache_write_credits_per_1m: 0,
+  })
   showForm.value = true
 }
 
@@ -112,6 +120,7 @@ function openEdit(m: ModelItem) {
   Object.assign(form, {
     name: m.name, display_name: m.display_name, description: m.description, enabled: m.enabled,
     prompt_credits_per_1m: m.prompt_credits_per_1m, completion_credits_per_1m: m.completion_credits_per_1m,
+    cache_read_credits_per_1m: m.cache_read_credits_per_1m ?? 0, cache_write_credits_per_1m: m.cache_write_credits_per_1m ?? 0,
   })
   showForm.value = true
 }
@@ -273,8 +282,15 @@ async function doImport() {
             <td class="px-4 py-3 font-mono text-xs font-medium">{{ m.name }}</td>
             <td class="px-4 py-3 text-muted-foreground">{{ m.display_name || '—' }}</td>
             <td class="px-4 py-3 text-center text-xs">
-              <span class="text-muted-foreground">入</span> {{ m.prompt_credits_per_1m }}
-              <span class="text-muted-foreground"> / 出</span> {{ m.completion_credits_per_1m }}
+              <div>
+                <span class="text-muted-foreground">入</span> {{ m.prompt_credits_per_1m }}
+                <span class="text-muted-foreground"> / 出</span> {{ m.completion_credits_per_1m }}
+              </div>
+              <div v-if="m.cache_read_credits_per_1m || m.cache_write_credits_per_1m" class="text-xs text-muted-foreground mt-0.5">
+                <span v-if="m.cache_read_credits_per_1m">缓存 {{ m.cache_read_credits_per_1m }}</span>
+                <span v-if="m.cache_read_credits_per_1m && m.cache_write_credits_per_1m"> / </span>
+                <span v-if="m.cache_write_credits_per_1m">写 {{ m.cache_write_credits_per_1m }}</span>
+              </div>
             </td>
             <td class="px-4 py-3 text-center">
               <Badge :variant="m.bindings.length ? 'secondary' : 'destructive'">{{ m.bindings.length }}</Badge>
@@ -317,6 +333,16 @@ async function doImport() {
           <div class="grid grid-cols-2 gap-4">
             <div class="space-y-2"><Label>输入积分 / 1M token</Label><Input v-model.number="form.prompt_credits_per_1m" type="number" /></div>
             <div class="space-y-2"><Label>输出积分 / 1M token</Label><Input v-model.number="form.completion_credits_per_1m" type="number" /></div>
+            <div class="space-y-2">
+              <Label>缓存命中积分 / 1M token</Label>
+              <Input v-model.number="form.cache_read_credits_per_1m" type="number" />
+              <p class="text-xs text-muted-foreground">留 0 表示按输入原价计费（不给折扣）。设成低于输入价即可对命中缓存的 token 打折。</p>
+            </div>
+            <div class="space-y-2">
+              <Label>缓存写入积分 / 1M token</Label>
+              <Input v-model.number="form.cache_write_credits_per_1m" type="number" />
+              <p class="text-xs text-muted-foreground">留 0 表示按输入原价计费。Anthropic 写缓存比原价更贵，需要时填高于输入价的值。</p>
+            </div>
           </div>
           <label class="flex items-center gap-2 text-sm">
             <input type="checkbox" v-model="form.enabled" class="rounded border-input" /> 启用该模型

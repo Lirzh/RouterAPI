@@ -7,7 +7,7 @@ import Card from '@/components/ui/Card.vue'
 import Input from '@/components/ui/Input.vue'
 import Label from '@/components/ui/Label.vue'
 import Badge from '@/components/ui/Badge.vue'
-import { Wallet as WalletIcon, Plus, ChevronLeft, ChevronRight } from 'lucide-vue-next'
+import { Wallet as WalletIcon, Plus, Ticket, ChevronLeft, ChevronRight } from 'lucide-vue-next'
 import { useAuthStore } from '@/stores/auth'
 
 interface Txn {
@@ -29,6 +29,10 @@ const auth = useAuthStore()
 const isAdmin = computed(() => auth.role === 'admin')
 
 const balance = ref(0)
+// 预留：在途请求已占住、尚未结算的积分。可用余额 = 余额 - 预留。
+// 不显示的话用户会看到"余额明明够却被告知余额不足"。
+const reserved = ref(0)
+const available = ref(0)
 const txns = ref<Txn[]>([])
 const total = ref(0)
 const page = ref(1)
@@ -39,6 +43,12 @@ const loading = ref(false)
 
 const showAdjust = ref(false)
 const adjustForm = reactive({ user_id: 0, amount: 0, type: 'topup', note: '' })
+
+// 兑换码
+const redeemCode = ref('')
+const redeeming = ref(false)
+const redeemMsg = ref('')
+const redeemOk = ref(false)
 
 onMounted(async () => {
   if (isAdmin.value) {
@@ -53,6 +63,8 @@ async function loadWallet() {
   try {
     const { data } = await api.get('/admin/wallet')
     balance.value = data.credits
+    reserved.value = data.reserved ?? 0
+    available.value = data.available ?? data.credits
     if (!isAdmin.value) {
       txns.value = data.data
       total.value = data.total
@@ -61,6 +73,25 @@ async function loadWallet() {
     loading.value = false
   }
   if (isAdmin.value) await loadTransactions()
+}
+
+async function submitRedeem() {
+  const code = redeemCode.value.trim()
+  if (!code) return
+  redeeming.value = true
+  redeemMsg.value = ''
+  redeemOk.value = false
+  try {
+    const { data } = await api.post('/admin/redeem', { code })
+    redeemOk.value = true
+    redeemMsg.value = `兑换成功，到账 ${new Intl.NumberFormat().format(data.credits)} 积分`
+    redeemCode.value = ''
+    await loadWallet()
+  } catch (e: any) {
+    redeemMsg.value = e.response?.data?.error || '兑换失败，请稍后重试'
+  } finally {
+    redeeming.value = false
+  }
 }
 
 async function loadTransactions() {
@@ -109,6 +140,7 @@ function typeBadge(t: string) {
     case 'consume': return { variant: 'default', text: '消费' }
     case 'refund': return { variant: 'warning', text: '退款' }
     case 'adjust': return { variant: 'secondary', text: '调整' }
+    case 'redeem': return { variant: 'success', text: '兑换码' }
     default: return { variant: 'secondary', text: t }
   }
 }
@@ -134,11 +166,37 @@ function fmt(n: number) { return new Intl.NumberFormat().format(n) }
         <div>
           <p class="text-sm text-muted-foreground">{{ isAdmin ? '我的积分余额' : '积分余额' }}</p>
           <p class="text-3xl font-bold mt-1">{{ loading ? '...' : fmt(balance) }}</p>
+          <p v-if="reserved > 0" class="text-xs text-muted-foreground mt-1">
+            可用 {{ fmt(available) }} · 在途请求占用 {{ fmt(reserved) }}
+          </p>
         </div>
         <div class="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center">
           <WalletIcon class="w-6 h-6 text-primary" />
         </div>
       </div>
+    </Card>
+
+    <!-- 兑换码：所有角色都能兑换到自己余额 -->
+    <Card class="p-4 mb-4">
+      <div class="flex items-center gap-3 flex-wrap">
+        <Label class="whitespace-nowrap">兑换码</Label>
+        <Input
+          v-model="redeemCode"
+          class="w-64 font-mono uppercase"
+          placeholder="XXXX-XXXX-XXXX-XXXX"
+          :disabled="redeeming"
+          @keyup.enter="submitRedeem"
+        />
+        <Button
+          class="h-9 px-4 bg-primary text-primary-foreground"
+          :disabled="redeeming || !redeemCode.trim()"
+          @click="submitRedeem"
+        >
+          <Ticket class="w-4 h-4" />{{ redeeming ? '兑换中…' : '兑换' }}
+        </Button>
+        <span v-if="redeemMsg" :class="redeemOk ? 'text-sm text-green-600' : 'text-sm text-red-600'">{{ redeemMsg }}</span>
+      </div>
+      <p class="text-xs text-muted-foreground mt-2">兑换码不区分大小写与分隔符；一码一用，兑换后积分立即计入本人余额。</p>
     </Card>
 
     <!-- 管理员：用户筛选 -->

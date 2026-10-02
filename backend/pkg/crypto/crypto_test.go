@@ -61,3 +61,20 @@ func TestMaskString(t *testing.T) {
 		t.Errorf("脱敏未包含 ****")
 	}
 }
+
+// 短密钥曾让 s[:2] 越界 panic（任何管理端列表接口都会被打成 500）；
+// 长度 8 时另一分支会把前 4 + 后 4 全部露出来，等于没脱敏。
+func TestMaskStringShortInputs(t *testing.T) {
+	for _, s := range []string{"", "k", "ab", "abcd1234", "abcdefgh", "0123456789"} {
+		m := MaskString(s)
+		if m == "" {
+			t.Errorf("MaskString(%q) 返回空串", s)
+		}
+		if len(s) >= 4 && strings.Contains(m, s) {
+			t.Errorf("MaskString(%q) 泄露了完整原文: %s", s, m)
+		}
+		if s != "" && len(s) <= 8 && m != "****" {
+			t.Errorf("短密钥 %q 应整串遮蔽, got %q", s, m)
+		}
+	}
+}

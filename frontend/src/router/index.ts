@@ -5,6 +5,13 @@ const router = createRouter({
   history: createWebHistory(),
   routes: [
     {
+      // 公开起始页 / 介绍页：不再把登录页作为首页，登录后由此进入控制台
+      path: '/',
+      name: 'home',
+      component: () => import('@/views/Home.vue'),
+      meta: { public: true },
+    },
+    {
       path: '/login',
       name: 'login',
       component: () => import('@/views/Login.vue'),
@@ -13,7 +20,6 @@ const router = createRouter({
     {
       path: '/',
       component: () => import('@/views/Layout.vue'),
-      redirect: '/dashboard',
       children: [
         {
           path: 'dashboard',
@@ -39,6 +45,12 @@ const router = createRouter({
           path: 'wallet',
           name: 'wallet',
           component: () => import('@/views/Wallet.vue'),
+        },
+        {
+          path: 'redeem-codes',
+          name: 'redeem-codes',
+          component: () => import('@/views/RedeemCodes.vue'),
+          meta: { requireAdmin: true },
         },
         {
           path: 'logs',

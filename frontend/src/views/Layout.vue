@@ -8,6 +8,7 @@ import {
   GitBranch,
   Key,
   Wallet,
+  Ticket,
   ScrollText,
   ShieldCheck,
   LogOut,
@@ -40,6 +41,7 @@ const allNavItems: NavItem[] = [
   { to: '/models', label: '模型', icon: GitBranch },
   { to: '/api-keys', label: 'API Key', icon: Key },
   { to: '/wallet', label: '积分钱包', icon: Wallet },
+  { to: '/redeem-codes', label: '兑换码', icon: Ticket, adminOnly: true },
   { to: '/logs', label: '调用日志', icon: ScrollText },
   { to: '/audit-logs', label: '操作审计', icon: ShieldCheck, adminOnly: true },
   { to: '/users', label: '用户管理', icon: Users, adminOnly: true },
@@ -81,7 +83,7 @@ function closeThemeMenu() {
     <aside class="w-60 bg-card border-r flex flex-col">
       <!-- Logo -->
       <div class="h-14 flex items-center justify-between px-6 border-b">
-        <span class="text-lg font-bold">RouterAPI</span>
+        <RouterLink to="/" class="text-lg font-bold tracking-tight hover:opacity-80" title="返回站点首页">RouterAPI</RouterLink>
         <!-- 主题切换 -->
         <div class="relative" @click.stop>
           <button
@@ -129,6 +131,18 @@ function closeThemeMenu() {
           {{ item.label }}
         </RouterLink>
       </nav>
+
+      <!-- 返回站点首页 / 排行榜 -->
+      <div class="px-3 pb-2">
+        <RouterLink
+          to="/"
+          class="flex items-center gap-2 px-3 py-2 rounded-md text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors"
+          title="返回站点首页（含全站排行榜）"
+        >
+          <span class="w-4 h-4 flex items-center justify-center text-base leading-none">↗</span>
+          站点首页 · 排行榜
+        </RouterLink>
+      </div>
 
       <!-- 用户信息 -->
       <div class="p-3 border-t">

@@ -256,7 +256,7 @@ function statusBadge(status: number) {
 
         <div v-else class="space-y-4">
           <div class="space-y-2"><Label>名称</Label><Input v-model="form.name" placeholder="例如: 团队A-调用Key" /></div>
-          <div v-if="!editingId" class="space-y-2"><Label>API Key（留空自动生成）</Label><Input v-model="form.key" placeholder="自动生成或自定义" /></div>
+          <div v-if="!editingId" class="space-y-2"><Label>API Key（留空自动生成）</Label><Input v-model="form.key" placeholder="自动生成；自定义至少 24 字符" /></div>
           <div class="grid grid-cols-2 gap-4">
             <div class="space-y-2">
               <Label>归属用户</Label>

@@ -22,6 +22,18 @@ func generateRandomKey(length int) string {
 	return hex.EncodeToString(b)
 }
 
+// isUniqueViolation 判别"唯一约束冲突"。两种驱动措辞不同，且 GORM 的
+// ErrDuplicatedKey 需要显式开启 TranslateError，这里不依赖那个开关。
+// 用它把原始驱动报错挡在响应外——那里面带着索引名和列名。
+func isUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "UNIQUE constraint failed") || // SQLite
+		strings.Contains(msg, "duplicate key value violates unique constraint") // PostgreSQL
+}
+
 // pagination 解析分页参数，返回 page、pageSize（已夹取到合法范围）。
 func pagination(c *gin.Context) (page, pageSize int) {
 	page, _ = strconv.Atoi(c.DefaultQuery("page", "1"))

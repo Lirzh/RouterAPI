@@ -9,10 +9,10 @@ import (
 // ============ Gemini 入站请求结构 ============
 
 type geminiRequest struct {
-	Contents          []geminiContent   `json:"contents"`
-	SystemInstruction *geminiContent    `json:"systemInstruction"`
-	GenerationConfig  *geminiGenConfig  `json:"generationConfig"`
-	Tools             []geminiTool      `json:"tools"`
+	Contents          []geminiContent  `json:"contents"`
+	SystemInstruction *geminiContent   `json:"systemInstruction"`
+	GenerationConfig  *geminiGenConfig `json:"generationConfig"`
+	Tools             []geminiTool     `json:"tools"`
 }
 
 type geminiContent struct {
@@ -66,7 +66,12 @@ func parseGemini(body []byte, pathModel string) (*ir.ChatRequest, error) {
 	if err := json.Unmarshal(body, &gr); err != nil {
 		return nil, err
 	}
-	req := &ir.ChatRequest{Model: pathModel}
+	// 同 Anthropic：用 Gemini 自己的词汇表判定未识别字段（toolConfig、attributes 等）。
+	extra, err := ir.CollectUnknown(body, ir.JSONKeys(gr))
+	if err != nil {
+		return nil, err
+	}
+	req := &ir.ChatRequest{Model: pathModel, Extra: extra}
 	if gc := gr.GenerationConfig; gc != nil {
 		req.Temperature = gc.Temperature
 		req.TopP = gc.TopP
@@ -127,7 +132,7 @@ func parseGemini(body []byte, pathModel string) (*ir.ChatRequest, error) {
 	for _, t := range gr.Tools {
 		for _, fd := range t.FunctionDeclarations {
 			req.Tools = append(req.Tools, ir.Tool{
-				Type: "function",
+				Type:     "function",
 				Function: ir.Function{Name: fd.Name, Description: fd.Description, Parameters: fd.Parameters},
 			})
 		}
@@ -148,11 +153,21 @@ func geminiPartsText(parts []geminiPart) string {
 func renderGeminiResponse(resp *ir.ChatResponse, virtualModel string) interface{} {
 	candidates := make([]map[string]interface{}, 0)
 	for _, choice := range resp.Choices {
+		msg := choice.Message
 		parts := make([]map[string]interface{}, 0)
-		if txt := choice.Message.TextOf(); txt != "" {
+		// 思维 part 用 thought:true 标记并排在正文前，与 Gemini 自身的输出形态一致；
+		// 混进正文会让客户端没法区分思考与答案。
+		if msg.ReasoningContent != "" {
+			blk := map[string]interface{}{"text": msg.ReasoningContent, "thought": true}
+			if msg.ReasoningSignature != "" {
+				blk["thoughtSignature"] = msg.ReasoningSignature
+			}
+			parts = append(parts, blk)
+		}
+		if txt := msg.TextOf(); txt != "" {
 			parts = append(parts, map[string]interface{}{"text": txt})
 		}
-		for _, tc := range choice.Message.ToolCalls {
+		for _, tc := range msg.ToolCalls {
 			var args interface{}
 			_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
 			parts = append(parts, map[string]interface{}{
@@ -169,28 +184,48 @@ func renderGeminiResponse(resp *ir.ChatResponse, virtualModel string) interface{
 		})
 	}
 	return map[string]interface{}{
-		"candidates": candidates,
-		"usageMetadata": map[string]interface{}{
-			"promptTokenCount":     resp.Usage.PromptTokens,
-			"candidatesTokenCount": resp.Usage.CompletionTokens,
-			"totalTokenCount":      resp.Usage.TotalTokens,
-		},
-		"modelVersion": virtualModel,
+		"candidates":    candidates,
+		"usageMetadata": geminiUsageMetadata(resp.Usage),
+		"modelVersion":  virtualModel,
 	}
+}
+
+// geminiUsageMetadata 组装用量。thoughtsTokenCount 只在确实知道时给出：
+// 报 0 与"未统计"对客户端是两种语义，前者会让计费面板以为这次没思考。
+func geminiUsageMetadata(u ir.Usage) map[string]interface{} {
+	m := map[string]interface{}{
+		"promptTokenCount":     u.PromptTokens,
+		"candidatesTokenCount": u.CompletionTokens - u.ReasoningTokens,
+		"totalTokenCount":      u.TotalTokens,
+	}
+	if u.ReasoningTokens > 0 {
+		m["thoughtsTokenCount"] = u.ReasoningTokens
+	}
+	if u.CachedTokens > 0 {
+		m["cachedContentTokenCount"] = u.CachedTokens
+	}
+	return m
 }
 
 // ============ Gemini 流式 ============
 
 func (sw *StreamWriter) writeGeminiChunk(chunk ir.ChatChunk) {
 	for _, ch := range chunk.Choices {
-		if ch.Delta.Content == "" {
+		parts := make([]map[string]interface{}, 0, 2)
+		if ch.Delta.ReasoningContent != "" {
+			parts = append(parts, map[string]interface{}{"text": ch.Delta.ReasoningContent, "thought": true})
+		}
+		if ch.Delta.Content != "" {
+			parts = append(parts, map[string]interface{}{"text": ch.Delta.Content})
+		}
+		if len(parts) == 0 {
 			continue
 		}
 		sw.writeData(map[string]interface{}{
 			"candidates": []map[string]interface{}{
 				{
 					"content": map[string]interface{}{
-						"parts": []map[string]interface{}{{"text": ch.Delta.Content}},
+						"parts": parts,
 						"role":  "model",
 					},
 					"index": 0,
@@ -214,11 +249,7 @@ func (sw *StreamWriter) finishGemini() {
 		"candidates": []map[string]interface{}{
 			{"content": map[string]interface{}{"parts": []map[string]interface{}{}, "role": "model"}, "finishReason": finish, "index": 0},
 		},
-		"usageMetadata": map[string]interface{}{
-			"promptTokenCount":     u.PromptTokens,
-			"candidatesTokenCount": u.CompletionTokens,
-			"totalTokenCount":      u.TotalTokens,
-		},
+		"usageMetadata": geminiUsageMetadata(u),
 	})
 	sw.gemFinishSent = true
 }

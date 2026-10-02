@@ -2,8 +2,27 @@
 server:
   port: 3000
   mode: debug  # debug | release
+  # 管理令牌签名密钥。对外运营（mode=release）时若仍是下面的占位值，服务会拒绝启动。
+  # 生成：openssl rand -hex 32
   jwt_secret: "change-me-to-a-random-secret"
   jwt_expire_hours: 48
+  # 供应商凭证加密密钥。请单独配一把，不要复用 jwt_secret：
+  # 一个值两用等于"能伪造管理令牌"和"能解出所有上游密钥"是同一次泄露。
+  # 从旧版本升级时直接填新值即可——启动时会用 jwt_secret 解开存量密文再重封一遍。
+  # 留空则暂时沿用 jwt_secret（会打一条告警）。
+  encrypt_key: ""
+  # 单次入站请求体上限（字节）。默认 20MiB，对齐 OpenAI 自家 chat/completions 的上限。
+  # 需要转发带多张 base64 图片的多模态请求时再调大；不接受"不限量"。
+  max_request_body_bytes: 20971520
+
+# 认证防护
+security:
+  # 登录尝试限流（每分钟）。两个维度各挡一类攻击：
+  #   login_per_ip_per_min   挡"一个来源扫一批账号"的凭据填充
+  #   login_per_user_per_min 挡"多个来源轮攻一个账号"的分布式爆破
+  # 留空/填 0 会用默认值（这里刻意不 fail-open：忘了配不该等于登录不限流）。
+  login_per_ip_per_min: 30
+  login_per_user_per_min: 10
 
 database:
   driver: sqlite          # sqlite | postgres
@@ -41,6 +60,27 @@ health:
 # 关闭则不计费、不拦截，仅记录 token 用量。
 billing:
   enabled: true
+
+# 转发行为
+gateway:
+  # 关闭"同格式直通"。入站协议与上游协议一致时（OpenAI 入站 -> OpenAI 兼容上游），
+  # 网关默认不再做 IR 往返：请求体只改 model 与补默认参数，响应/SSE 帧原样透传，
+  # 只从中读出 usage 计费。打开这个开关会退回"全部经 IR 转换"的老路径，
+  # 用于排查"客户端看到的字节不对劲"这类问题。缺省（不写）为直通开启。
+  raw_lane_disabled: false
+
+# 全站用户排行榜（公开接口 /api/leaderboard + 起始页展示）
+# 省略整段 = 公开、不匿名、默认 20 条上限 50（与历史行为一致）。
+leaderboard:
+  # 关闭公开排行榜：接口返回 enabled=false，起始页显示"未开放"。
+  # 注意：这不同于"仅登录可见"——后者需把路由从公开组挪到 /api/admin 受保护组。
+  public_disabled: false
+  # 匿名化用户名：服务端只保留首字符 + 掩码后再返回，公开响应体里不含真实用户名。
+  anonymize: false
+  # 未带 limit 参数时返回的条数。
+  default_limit: 20
+  # 单次返回条数硬上限（前端 Top N 选择器也受此约束）。
+  max_limit: 50
 
 # 可信代理（用于正确解析 X-Forwarded-For 得到真实客户端 IP）
 # 留空表示不信任任何代理（公网部署的保守安全默认）

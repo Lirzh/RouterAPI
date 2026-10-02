@@ -210,29 +210,47 @@ func weightedSelect(candidates []candidate) candidate {
 // ============ 供应商状态维护 ============
 
 // MarkVendorError 记录供应商错误：累加连续错误，超阈值则进入熔断冷却。
+//
+// 两点刻意的设计：
+//  1. 计数走 SQL 相对自增而非"读-改-写"。供应商抖动时多个请求会并发失败，
+//     读改写会互相吞掉计数，熔断因此比配置的阈值更晚才触发。
+//  2. 不持有 b.mu。那是路由缓存的锁，原来把它横跨两次 DB 写持有，等于一次失败
+//     就把所有并发的 Route 读者堵住；而且原先无条件清空整个缓存，上游 brownout 时
+//     每次失败都全量失效 -> 每个请求回源查 model+bindings+vendor -> 缓存被打穿成风暴。
+//     现在只有"路由可用性真的变了"（进入冷却）才失效缓存。
 func (b *Balancer) MarkVendorError(vendorID uint, errMsg string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	var v model.Vendor
-	if err := b.db.First(&v, vendorID).Error; err != nil {
+	res := b.db.Model(&model.Vendor{}).Where("id = ?", vendorID).
+		Updates(map[string]interface{}{
+			"consecutive_errors": gorm.Expr("consecutive_errors + 1"),
+			"last_error":         truncateStr(errMsg, 1024),
+			"updated_at":         time.Now(),
+		})
+	if res.Error != nil {
+		logrus.Warnf("累加供应商 %d 错误计数失败: %v", vendorID, res.Error)
 		return
 	}
-	consecutive := v.ConsecutiveErrors + 1
-	updates := map[string]interface{}{
-		"consecutive_errors": consecutive,
-		"last_error":         truncateStr(errMsg, 1024),
-		"updated_at":         time.Now(),
+
+	var v model.Vendor
+	if err := b.db.Select("id", "consecutive_errors").First(&v, vendorID).Error; err != nil {
+		return
 	}
-	if consecutive >= cooldownErrorThreshold {
-		coolUntil := time.Now().Add(cooldownDuration)
-		updates["cooldown_until"] = coolUntil
-		updates["consecutive_errors"] = 0 // 重置计数，冷却到期后重新累计
-		logrus.Warnf("供应商 %d 连续失败 %d 次，进入熔断冷却至 %s: %s",
-			vendorID, consecutive, coolUntil.Format(time.DateTime), truncateStr(errMsg, 200))
+	if v.ConsecutiveErrors < cooldownErrorThreshold {
+		return // 供应商仍然可路由，不动缓存
 	}
-	b.db.Model(&model.Vendor{}).Where("id = ?", vendorID).Updates(updates)
-	b.cache = make(map[string]*routeEntry) // 状态已变，立即失效路由缓存
+
+	coolUntil := time.Now().Add(cooldownDuration)
+	if err := b.db.Model(&model.Vendor{}).Where("id = ?", vendorID).
+		Updates(map[string]interface{}{
+			"cooldown_until":     coolUntil,
+			"consecutive_errors": 0, // 重置计数，冷却到期后重新累计
+			"updated_at":         time.Now(),
+		}).Error; err != nil {
+		logrus.Warnf("供应商 %d 进入熔断冷却失败: %v", vendorID, err)
+		return
+	}
+	logrus.Warnf("供应商 %d 连续失败，进入熔断冷却至 %s: %s",
+		vendorID, coolUntil.Format(time.DateTime), truncateStr(errMsg, 200))
+	b.invalidateCache()
 }
 
 // MarkVendorOK 记录供应商成功：清零连续错误。

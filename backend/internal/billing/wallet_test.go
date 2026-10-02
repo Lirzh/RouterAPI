@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/glebarez/sqlite"
+	"github.com/routerapi/backend/internal/ir"
 	"github.com/routerapi/backend/internal/model"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
@@ -19,7 +20,7 @@ func newTestDB(t *testing.T) *gorm.DB {
 	if sqlDB, err := db.DB(); err == nil {
 		sqlDB.SetMaxOpenConns(1)
 	}
-	if err := db.AutoMigrate(&model.User{}, &model.CreditTransaction{}); err != nil {
+	if err := db.AutoMigrate(&model.User{}, &model.CreditTransaction{}, &model.QuotaReservation{}, &model.RedemptionCode{}); err != nil {
 		t.Fatalf("迁移失败: %v", err)
 	}
 	return db
@@ -36,25 +37,34 @@ func seedUser(t *testing.T, db *gorm.DB, credits int64) uint {
 
 func TestCreditsForUsage(t *testing.T) {
 	cases := []struct {
-		name                         string
-		prompt, completion           int
-		promptPer1M, completionPer1M int64
-		want                         int64
+		name    string
+		usage   ir.Usage
+		pricing Pricing
+		want    int64
 	}{
-		{"全免费", 1000, 500, 0, 0, 0},
-		{"整百万精确", 1_000_000, 1_000_000, 100, 200, 300},
-		{"向上取整prompt", 1, 0, 1_000_000, 0, 1},    // 1 token × 1e6/1e6 = 1
-		{"向上取整不足1积分", 1, 1, 1, 1, 2},             // ceil(1/1e6)=1 各一份
-		{"混合定价", 1500, 2500, 2000, 4000, 3 + 10}, // ceil(1500*2000/1e6)=3, ceil(2500*4000/1e6)=10
-		{"仅completion计费", 0, 1_000_000, 500, 300, 300},
-		{"零用量", 0, 0, 1000, 1000, 0},
+		{"全免费", ir.Usage{PromptTokens: 1000, CompletionTokens: 500}, Pricing{}, 0},
+		{"整百万精确", ir.Usage{PromptTokens: 1_000_000, CompletionTokens: 1_000_000}, Pricing{Prompt: 100, Completion: 200}, 300},
+		{"向上取整prompt", ir.Usage{PromptTokens: 1}, Pricing{Prompt: 1_000_000}, 1},
+		{"向上取整不足1积分", ir.Usage{PromptTokens: 1, CompletionTokens: 1}, Pricing{Prompt: 1, Completion: 1}, 2},
+		{"混合定价", ir.Usage{PromptTokens: 1500, CompletionTokens: 2500}, Pricing{Prompt: 2000, Completion: 4000}, 3 + 10},
+		{"仅completion计费", ir.Usage{CompletionTokens: 1_000_000}, Pricing{Prompt: 500, Completion: 300}, 300},
+		{"零用量", ir.Usage{}, Pricing{Prompt: 1000, Completion: 1000}, 0},
+
+		// 缓存维度：未配置独立单价时回落 prompt，金额与引入缓存前一致。
+		{"缓存未配置价_等同全价", ir.Usage{PromptTokens: 1_000_000, CachedTokens: 800_000}, Pricing{Prompt: 100}, 100},
+		{"缓存读取折扣", ir.Usage{PromptTokens: 1_000_000, CachedTokens: 800_000}, Pricing{Prompt: 100, CacheRead: 10},
+			ceilDiv(200_000*100, 1e6) + ceilDiv(800_000*10, 1e6)},
+		{"缓存写入加价", ir.Usage{PromptTokens: 1_000_000, CacheWriteTokens: 500_000}, Pricing{Prompt: 100, CacheWrite: 125},
+			ceilDiv(500_000*100, 1e6) + ceilDiv(500_000*125, 1e6)},
+		// 畸形子集不得把整单算成负数或小额：收缩后按全价 prompt 收。
+		{"子集超出prompt_收缩到全价", ir.Usage{PromptTokens: 100, CachedTokens: 5000, CacheWriteTokens: 5000}, Pricing{Prompt: 100, CacheRead: 1}, 1},
+		{"负数子集_忽略", ir.Usage{PromptTokens: 1_000_000, CachedTokens: -500}, Pricing{Prompt: 100}, 100},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := CreditsForUsage(tc.prompt, tc.completion, tc.promptPer1M, tc.completionPer1M)
+			got := CreditsForUsage(tc.usage, tc.pricing)
 			if got != tc.want {
-				t.Errorf("CreditsForUsage(%d,%d,%d,%d) = %d, want %d",
-					tc.prompt, tc.completion, tc.promptPer1M, tc.completionPer1M, got, tc.want)
+				t.Errorf("CreditsForUsage(%+v, %+v) = %d, want %d", tc.usage, tc.pricing, got, tc.want)
 			}
 		})
 	}

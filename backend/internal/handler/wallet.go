@@ -21,9 +21,19 @@ func NewWalletHandler(db *gorm.DB) *WalletHandler {
 }
 
 // GetWallet 当前登录用户的积分余额 + 本人流水（分页）。所有角色可访问自己的钱包。
+//
+// 除 credits 外还要报 reserved/available：预留会把在途请求的额度先占住，
+// 只报 credits 的话用户会看到"余额明明够却被告知余额不足"。
 func (h *WalletHandler) GetWallet(c *gin.Context) {
 	userID := c.GetUint("user_id")
-	balance, _ := billing.Balance(h.db, userID)
+	var u model.User
+	if err := h.db.Select("id", "credits", "reserved_credits").First(&u, userID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "账户不存在"})
+		return
+	}
+	balance := u.Credits
+	reserved := u.ReservedCredits
+	available := balance - reserved
 
 	page, pageSize := pagination(c)
 	query := h.db.Model(&model.CreditTransaction{}).Where("user_id = ?", userID)
@@ -42,6 +52,8 @@ func (h *WalletHandler) GetWallet(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"credits":   balance,
+		"reserved":  reserved,
+		"available": available,
 		"data":      txns,
 		"total":     total,
 		"page":      page,

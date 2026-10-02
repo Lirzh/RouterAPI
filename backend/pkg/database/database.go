@@ -1,6 +1,7 @@
 package database
 
 import (
+	"strings"
 	"time"
 
 	"github.com/glebarez/sqlite"
@@ -16,6 +17,22 @@ import (
 // DefaultAdminCredits 首次创建的默认管理员积分余额（积分制，不挂钩现实货币）。
 // 给一个较大初值，保证系统开箱可用；成员积分由管理员分配。
 const DefaultAdminCredits int64 = 1_000_000_000
+
+// Close 关闭底层连接池。SQLite 靠它把 WAL 正常收尾，PostgreSQL 靠它归还连接。
+// 调用点必须晚于所有还在写库的协程与在途请求，否则结算/日志写入会撞上 "sql: database is closed"。
+func Close(db *gorm.DB) {
+	if db == nil {
+		return
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		logrus.Warnf("取底层连接池失败，跳过关闭: %v", err)
+		return
+	}
+	if err := sqlDB.Close(); err != nil {
+		logrus.Warnf("关闭数据库连接失败: %v", err)
+	}
+}
 
 // Init 依据配置初始化数据库连接（支持 SQLite 与 PostgreSQL）。
 func Init(cfg config.DBConfig) (*gorm.DB, error) {
@@ -34,7 +51,7 @@ func Init(cfg config.DBConfig) (*gorm.DB, error) {
 			logrus.Info("数据库连接成功 (PostgreSQL)")
 		}
 	default:
-		db, err = gorm.Open(sqlite.Open(cfg.Path), gormCfg)
+		db, err = gorm.Open(sqlite.Open(withSQLitePragmas(cfg.Path)), gormCfg)
 		if err == nil {
 			logrus.Info("数据库连接成功 (SQLite)")
 		}
@@ -43,6 +60,19 @@ func Init(cfg config.DBConfig) (*gorm.DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+// withSQLitePragmas 给 SQLite DSN 附加必需的 PRAGMA。
+//
+// busy_timeout：请求路径上存在并发写事务（预留/结算/供应商状态/日志），
+// 而 SQLite 默认拿不到写锁就立刻返回 SQLITE_BUSY，会把锁冲突直接暴露成线上 500。
+// journal_mode(WAL)：让读不阻塞写。内存库不支持 WAL，SQLite 会自行回退成 memory，无副作用。
+// 调用方已显式提供 query 参数时原样返回，不覆盖其配置。
+func withSQLitePragmas(path string) string {
+	if path == "" || strings.Contains(path, "?") {
+		return path
+	}
+	return path + "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)"
 }
 
 // AutoMigrate 创建/更新所有表结构。
@@ -55,6 +85,8 @@ func AutoMigrate(db *gorm.DB) error {
 		&model.APIKey{},
 		&model.RequestLog{},
 		&model.CreditTransaction{},
+		&model.QuotaReservation{},
+		&model.RedemptionCode{},
 		&model.AuditLog{},
 		&model.StatData{},
 	)

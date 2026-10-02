@@ -16,8 +16,11 @@ import (
 // auditBodyMaxBytes 审计中间件缓冲请求体的上限（管理端 JSON 通常很小，超限截断仅用于提取白名单字段）。
 const auditBodyMaxBytes = 64 * 1024
 
-// auditExtraWhitelist 允许写入审计 Extra 的安全标量字段白名单。
-// 绝不包含 password / api_key / key 等敏感字段。
+// auditExtraWhitelist 审计 Extra 允许记录的请求体字段。
+//
+// 白名单而非黑名单：新字段默认不进审计日志。绝不在此加入 "code"（兑换码）、
+// "api_key"、"key" 或任何凭证字段——它们是可用的 bearer 凭证，落进审计表
+// 等于把权限数据的读取面扩大到所有能看审计日志的人。
 var auditExtraWhitelist = []string{
 	"name", "display_name", "protocol", "role", "status", "enabled",
 	"model", "upstream_model", "base_url", "priority", "weight", "params",

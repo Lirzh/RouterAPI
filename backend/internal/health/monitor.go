@@ -2,9 +2,11 @@ package health
 
 import (
 	"context"
+	"net/http"
 	"time"
 
 	"github.com/routerapi/backend/internal/balancer"
+	"github.com/routerapi/backend/internal/errkit"
 	"github.com/routerapi/backend/internal/model"
 	"github.com/routerapi/backend/internal/provider"
 	"github.com/routerapi/backend/pkg/crypto"
@@ -90,11 +92,27 @@ func (m *Monitor) probeOnce() {
 		ctx, cancel := context.WithTimeout(context.Background(), m.probeTimeout)
 		_, perr := prov.Models(ctx)
 		cancel()
-		if perr == nil {
+
+		switch {
+		case perr == nil:
 			m.bal.RecoverVendor(v.ID)
-		} else {
+		case probeInconclusive(perr):
+			// 上游应答了，只是没实现模型发现端点（不少 Claude/Gemini 兼容网关只有对话端点）。
+			// 此时既不能判健康（密钥可能已经死了），也绝不能延长冷却——那会把一个
+			// 对话完全正常的供应商永久锁死在"探测失败 -> 续期"里。让它自然到期，交给真实流量判定。
+			logrus.Debugf("健康探测：供应商 %d 无模型发现端点，保持冷却至自然到期", v.ID)
+		default:
 			m.bal.ExtendCooldown(v.ID, perr.Error())
 			logrus.Debugf("健康探测：供应商 %d 仍不可用，延长冷却: %v", v.ID, perr)
 		}
 	}
+}
+
+// probeInconclusive 判定一次探测失败是否"说明不了健康问题"。
+//
+// 404/405 表示服务是活的（DNS/TLS/HTTP 都通了），只是该上游不提供模型列表；
+// 其余（401/403/429/5xx/网络层错误）才是明确的"还没恢复"信号。
+func probeInconclusive(err error) bool {
+	code := errkit.FromError(err).StatusCode
+	return code == http.StatusNotFound || code == http.StatusMethodNotAllowed
 }
