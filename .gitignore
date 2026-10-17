@@ -5,6 +5,9 @@ bin/
 # Data
 backend/data/
 
+# Logs
+*.log
+
 # Dependencies
 frontend/node_modules/
 
